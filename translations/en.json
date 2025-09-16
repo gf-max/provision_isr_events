@@ -1,0 +1,27 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Provision-ISR ONVIF Events",
+        "description": "Inserisci i parametri ONVIF del tuo NVR Provision-ISR.",
+        "data": {
+          "host": "Host/IP",
+          "port": "Porta (default 80)",
+          "username": "Username",
+          "password": "Password"
+        }
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "basic": {
+        "title": "Opzioni",
+        "data": {
+          "auto_off": "Auto OFF (secondi)",
+          "channels": "Canali (es. 1,2,6) — vuoto = unknown"
+        }
+      }
+    }
+  }
+}
