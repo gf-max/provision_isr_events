@@ -1,0 +1,35 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Provision-ISR ONVIF Events",
+        "description": "Inserisci i parametri ONVIF del tuo NVR Provision-ISR.",
+        "data": {
+          "host": "Host/IP",
+          "port": "Porta (default 80)",
+          "username": "Username",
+          "password": "Password"
+        }
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "basic": {
+        "title": "Opzioni",
+        "description": "Impostazioni generali e elenco canali.",
+        "data": {
+          "auto_off": "Auto OFF (secondi)",
+          "channels": "Canali (es. 1,2,6) — vuoto = unknown",
+          "snapshot_on_motion": "Scatta snapshot al movimento (default)",
+          "snapshot_dir": "Cartella snapshot (relativa a /config, es. www/snapshots)",
+          "keep_latest_only": "Conserva solo l'ultimo snapshot per canale"
+        }
+      },
+      "channels": {
+        "title": "Canali",
+        "description": "Configura snapshot e camera per i canali: {channels}"
+      }
+    }
+  }
+}

@@ -1,7 +1,6 @@
 {
   "name": "Provision-ISR ONVIF Events",
   "content_in_root": false,
-  "domains": ["provision_isr_events"],
-  "country": "all",
-  "homeassistant": "2024.6.0"
+  "render_readme": true,
+  "domains": ["provision_isr_events"]
 }
