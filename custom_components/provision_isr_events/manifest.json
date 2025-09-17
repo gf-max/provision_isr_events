@@ -1,7 +1,7 @@
 {
   "domain": "provision_isr_events",
   "name": "Provision-ISR ONVIF Events",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "documentation": "https://github.com/gf-max/provision_isr_events/blob/master/README.md",
   "issue_tracker": "https://github.com/gf-max/provision_isr_events/issues",
   "codeowners": ["@gf-max"],
