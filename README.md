@@ -1,61 +1,116 @@
-# Provision-ISR ONVIF Events & Camera Integration for Home Assistant
+# Provision-ISR Events Integration
 
-This is a **custom integration for Home Assistant** that provides support for **Provision-ISR NVRs and cameras** using the ONVIF protocol.
+## Overview
+This custom integration for **Home Assistant** allows you to receive motion and alarm events directly from a **Provision-ISR NVR/DVR** using the ONVIF protocol.  
+Each camera channel from your NVR will appear in Home Assistant as a **binary sensor**:  
+- **ON** → Motion detected  
+- **OFF** → No motion  
+This makes it possible to trigger **automations, notifications, or actions** in your smart home based on NVR events.
 
-## ✨ Features
+## Features
+- Automatic discovery of NVR channels (cameras).  
+- One binary sensor per channel (e.g., `binary_sensor.nvr_motion_1`).  
+- Real-time updates via ONVIF PullPoint subscription.  
+- Configurable auto-off timer (e.g., reset after 3 seconds).  
+- Per-channel auto-off customization (`auto_off_map`).  
+- Fallback “unknown” sensor if no channels are configured (useful to test events).  
+- Multi-NVR support.  
 
-- **Event handling**  
-  - Subscribes to ONVIF event streams (motion, alarms, channels).  
-  - Creates `binary_sensor` entities in Home Assistant for each active channel.  
+## Installation
+1. Copy the `provision_isr_events` folder into `config/custom_components/` in your Home Assistant setup.  
+2. Restart Home Assistant.  
+3. Go to **Settings → Devices & Services → Add Integration** and search for **Provision-ISR Events**.  
+4. Enter your NVR connection details (host, port, username, password).  
 
-- **Camera support**  
-  - Discovers ONVIF media profiles (via `GetProfiles`).  
-  - Resolves RTSP stream URIs (`GetStreamUri`).  
-  - Provides still images (snapshots) with full **Digest authentication** support and vendor-specific fallbacks.  
-  - Creates one `camera` entity per channel/profile.  
+## Options
+- **Auto OFF (seconds):** Default time before a motion sensor resets to OFF.  
+- **Auto OFF Map:** Optional per-channel configuration. Example:  
+  - `5:3,7:2.5` → Channel 5 resets after 3 seconds, Channel 7 after 2.5 seconds.  
+- **Channels:** Choose which channels to monitor (e.g., `1,2,6`). Leave empty to include all channels.  
 
-- **Vendor fallbacks**  
-  - Works with Provision-ISR native snapshot endpoints.  
-  - Compatible with Dahua/Hikvision OEM snapshot URLs when channel mapping is known.  
+## Example Automations
 
-- **Config Flow**  
-  - Integration is configured directly from the UI (no YAML needed).  
-  - Supports options for auto-off timers, channel selection, snapshot timeouts, etc.
+### 1. Motion → Turn on Light
+```yaml
+alias: Motion - Entrance Light
+trigger:
+  - platform: state
+    entity_id: binary_sensor.nvr_motion_1
+    to: "on"
+action:
+  - service: light.turn_on
+    target:
+      entity_id: light.entrance
+```
 
-## 📦 Installation
+### 2. Motion → Notification with Snapshot
+```yaml
+alias: Motion Camera 3 Notification
+trigger:
+  - platform: state
+    entity_id: binary_sensor.nvr_motion_3
+    to: "on"
+action:
+  - service: notify.mobile_app_myphone
+    data:
+      message: "Motion detected on Camera 3!"
+```
 
-### HACS (recommended)
-1. In HACS, add this repository as a **Custom Repository** (type: Integration).  
-2. Search for **Provision-ISR Events** and install.  
-3. Restart Home Assistant.
+### 3. Motion → Camera Popup (Browser Mod)
+(*requires [Browser Mod](https://github.com/thomasloven/hass-browser_mod)*)
+```yaml
+alias: Motion Camera 5 Notification with Snapshot Event
+trigger:
+  - platform: event
+    event_type: provision_isr_events.snapshot_saved
+    event_data:
+      entity_id: binary_sensor.nvr_motion_5
+action:
+  - service: notify.mobile_app_myphone
+    data:
+      message: "Motion detected on Camera 5!"
+      data:
+        image: "{{ trigger.event.data.url }}"
 
-### Manual
-1. Copy the `custom_components/provision_isr_events/` folder into your Home Assistant `config/custom_components/`.  
-2. Restart Home Assistant.
+```
 
-## ⚙️ Configuration
+## Troubleshooting
+- If sensors remain OFF, ensure the ONVIF user in the NVR has permission for **Event service**.  
+- Use Home Assistant **Developer Tools → States** to check sensor values.  
+- Enable DEBUG logs in `configuration.yaml` if needed:  
+```yaml
+logger:
+  default: warning
+  logs:
+    custom_components.provision_isr_events: debug
+```
 
-1. Go to **Settings → Devices & Services → Add Integration**.  
-2. Search for **Provision-ISR ONVIF Events**.  
-3. Enter the connection details of your NVR (host, port, username, password).  
-4. After setup, sensors and camera entities will be created automatically.
+## Disclaimer
+This is a **community-made integration**.  
+- It is **not affiliated with, authorized, or endorsed by Provision-ISR**.  
+- The Provision-ISR name and logo are trademarks of their respective owners.  
+- This project does not attempt to misuse, exploit, or misrepresent the brand.  
+- Use at your own risk.  
 
-### Options
-- **Auto OFF (seconds)**: automatically reset motion sensors after N seconds.  
-- **Channels**: restrict discovery to specific channels (e.g. `1,2,6`).  
-- **Snapshot mode**: choose between `auto`, `urlcreds`, `basic`, or disable snapshots.  
-- **Snapshot timeout**: maximum wait time for a snapshot request.
+## License
+MIT License  
 
-## 🖼️ Branding
+Copyright (c) 2025 Fabio Bellavia
 
-This integration includes a **generic CCTV icon set** to avoid trademark issues.  
-Logos and icons are published under [home-assistant/brands](https://github.com/home-assistant/brands).
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:  
 
-## 🔒 Disclaimer
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.  
 
-This project is **community-maintained** and **not affiliated with Provision-ISR**.  
-Use at your own risk. Tested on NVR5-8200PX+ and similar Provision-ISR devices.
-
-## 📜 License
-
-Released under the MIT License. See [LICENSE](LICENSE) for details.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
