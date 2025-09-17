@@ -5,3 +5,13 @@ __pycache__/
 .env/
 .venv/
 .cache/
+__pycache__/__init__.cpython-312.pyc
+__pycache__/binary_sensor.cpython-312.pyc
+__pycache__/config_flow.cpython-312.pyc
+__pycache__/const.cpython-312.pyc
+__pycache__/manager.cpython-312.pyc
+__pycache__/__init__.cpython-312.pyc
+__pycache__/binary_sensor.cpython-312.pyc
+__pycache__/config_flow.cpython-312.pyc
+__pycache__/const.cpython-312.pyc
+__pycache__/manager.cpython-312.pyc

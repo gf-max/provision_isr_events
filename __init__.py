@@ -1,49 +1,59 @@
-from homeassistant.const import EVENT_HOMEASSISTANT_STOP
-from homeassistant.config_entries import ConfigEntry
+from __future__ import annotations
+
+import logging
 from homeassistant.core import HomeAssistant
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.helpers.typing import ConfigType
+
 from .const import DOMAIN, PLATFORMS
 from .manager import ProvisionOnvifEventManager
 
-async def async_setup_entry(hass, entry):
-    data = entry.data
+_LOGGER = logging.getLogger(__name__)
+
+# hass.data layout:
+# hass.data[DOMAIN] = { entry_id: { "manager": ProvisionOnvifEventManager } }
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up the integration (YAML not supported)."""
+    hass.data.setdefault(DOMAIN, {})
+    return True
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Set up a config entry: start the ONVIF event manager and forward platforms."""
+    _LOGGER.info("Setting up entry %s", entry.entry_id)
+
     mgr = ProvisionOnvifEventManager(
-        hass=hass,
-        host=data["host"],
-        port=data["port"],
-        username=data["username"],
-        password=data["password"],
+        hass,
+        host=entry.data.get("host"),
+        port=entry.data.get("port"),
+        username=entry.data.get("username"),
+        password=entry.data.get("password"),
         entry_id=entry.entry_id,
     )
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {"manager": mgr}
-    # imposta default una volta, se mancante
-    if "auto_off" not in entry.options:
-        hass.config_entries.async_update_entry(
-            entry, options={**entry.options, "auto_off": 3}  # 3 secondi
-        )
-    # 🔧 AVVIO MANAGER (se è sync usa executor)
-    await hass.async_add_executor_job(mgr.start)
+    await mgr.async_start()
+    hass.data[DOMAIN][entry.entry_id] = {"manager": mgr}
 
-    # stop pulito quando HA si spegne
-    def _on_ha_stop(_):
-        try:
-            mgr.stop()
-        except Exception:
-            pass
-    entry.async_on_unload(hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _on_ha_stop))
+    async def _options_updated(hass: HomeAssistant, updated_entry: ConfigEntry) -> None:
+        _LOGGER.debug("Options updated for %s — reloading entry", updated_entry.entry_id)
+        await hass.config_entries.async_reload(updated_entry.entry_id)
+
+    entry.async_on_unload(entry.add_update_listener(_options_updated))
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
-# ricarica entità quando cambiano le opzioni
-async def _update_listener(hass, updated_entry):
-    await hass.config_entries.async_reload(updated_entry.entry_id)
+
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Unload a config entry: stop the manager and unload platforms."""
+    _LOGGER.info("Unloading entry %s", entry.entry_id)
+
+    data = hass.data.get(DOMAIN, {}).pop(entry.entry_id, {})
+    mgr: ProvisionOnvifEventManager | None = data.get("manager")  # type: ignore[assignment]
+    if mgr:
+        await mgr.async_stop()
+
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    if unload_ok:
-        # ferma eventuale thread/polling del manager se hai uno stop()
-        try:
-            hass.data[DOMAIN][entry.entry_id]["manager"].stop()
-        except Exception:
-            pass
-        hass.data[DOMAIN].pop(entry.entry_id, None)
+    if not unload_ok:
+        _LOGGER.warning("Some platforms failed to unload for %s", entry.entry_id)
     return unload_ok

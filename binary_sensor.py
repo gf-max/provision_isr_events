@@ -1,16 +1,29 @@
 from __future__ import annotations
+import logging
 from typing import Callable, Optional
 
-from homeassistant.components.binary_sensor import BinarySensorEntity, BinarySensorDeviceClass
+from homeassistant.components.binary_sensor import (
+    BinarySensorEntity,
+    BinarySensorDeviceClass,
+)
 from homeassistant.core import callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.event import async_call_later
 
 from .const import DOMAIN, SIGNAL_DISCOVERY, SIGNAL_MOTION
 
+_LOGGER = logging.getLogger(__name__)
+
+
 def _parse_auto_off_map(s: str | None) -> dict[str, float]:
     """
-    Esempio stringa: "5:3,7:2.5" -> {"5": 3.0, "7": 2.5}
+    Parse a per-channel auto-off map.
+
+    Example input string:
+      "5:3,7:2.5"  ->  {"5": 3.0, "7": 2.5}
+
+    Returns:
+      dict[channel_as_str] = seconds_as_float
     """
     if not s:
         return {}
@@ -24,38 +37,66 @@ def _parse_auto_off_map(s: str | None) -> dict[str, float]:
         try:
             out[ch] = float(sec.strip())
         except ValueError:
+            _LOGGER.debug("Ignoring invalid auto_off_map fragment: %r", part)
             continue
     return out
 
 
 async def async_setup_entry(hass, entry, async_add_entities):
-    mgr = hass.data[DOMAIN][entry.entry_id]["manager"]
+    """Set up motion binary sensors for a config entry."""
+    mgr = hass.data[DOMAIN][entry.entry_id]["manager"]  # kept for symmetry, if needed
 
     known: set[str] = set()
 
-    # Leggi opzioni
+    # Read options
     auto_off_default = float(entry.options.get("auto_off", 3) or 3)
     auto_off_map = _parse_auto_off_map(entry.options.get("auto_off_map"))
+
+    _LOGGER.debug(
+        "[%s] Options loaded: auto_off_default=%.3f, auto_off_map=%s",
+        entry.entry_id,
+        auto_off_default,
+        auto_off_map,
+    )
 
     def _add(ch: str):
         ch = str(ch)
         if ch in known:
+            _LOGGER.debug("[%s] Channel %s already added, skipping.", entry.entry_id, ch)
             return
         known.add(ch)
         auto_off = auto_off_map.get(ch, auto_off_default)
-        async_add_entities([ProvisionMotionBinarySensor(hass, entry.entry_id, ch, auto_off)], True)
+        _LOGGER.info(
+            "[%s] Adding motion binary_sensor for channel=%s (auto_off=%s s)",
+            entry.entry_id,
+            ch,
+            auto_off,
+        )
+        async_add_entities(
+            [ProvisionMotionBinarySensor(hass, entry.entry_id, ch, auto_off)], True
+        )
 
-    # Pre-semina canali da options (se presenti)
+    # Pre-seed channels from options (if provided)
     channels_opt = (entry.options.get("channels") or "").strip()
     if channels_opt:
+        _LOGGER.debug("[%s] Pre-seeding channels from options: %s", entry.entry_id, channels_opt)
         for ch in (c.strip() for c in channels_opt.split(",") if c.strip()):
             _add(ch)
     else:
-        # sensore jolly per vedere subito qualcosa
+        # Fallback "wildcard" sensor so users can see something immediately
+        _LOGGER.info(
+            "[%s] No channels specified; creating wildcard sensor 'unknown'.",
+            entry.entry_id,
+        )
         _add("unknown")
 
     @callback
     def _on_discovery(channel: str):
+        _LOGGER.info(
+            "[%s] Discovery: new channel detected -> %s",
+            entry.entry_id,
+            channel,
+        )
         _add(str(channel))
 
     unsub_disc = async_dispatcher_connect(
@@ -65,10 +106,18 @@ async def async_setup_entry(hass, entry, async_add_entities):
 
 
 class ProvisionMotionBinarySensor(BinarySensorEntity):
+    """Binary sensor that reflects ONVIF motion events from the NVR."""
+
     _attr_should_poll = False
     _attr_device_class = BinarySensorDeviceClass.MOTION
 
-    def __init__(self, hass, entry_id: str, channel: str, auto_off_seconds: float = 0.0):
+    def __init__(
+        self,
+        hass,
+        entry_id: str,
+        channel: str,
+        auto_off_seconds: float = 0.0,
+    ):
         self.hass = hass
         self._entry_id = entry_id
         self._channel = str(channel)
@@ -77,10 +126,18 @@ class ProvisionMotionBinarySensor(BinarySensorEntity):
         self._attr_is_on = False
 
         # AUTO-OFF
-        self._auto_off: float = float(auto_off_seconds)  # 0 = disattivato
+        self._auto_off: float = float(auto_off_seconds)  # 0 = disabled
         self._auto_unsub: Optional[Callable[[], None]] = None
 
         self._unsub_motion: Optional[Callable[[], None]] = None
+
+        _LOGGER.debug(
+            "[%s][ch=%s] Sensor created (auto_off=%s s, unique_id=%s)",
+            self._entry_id,
+            self._channel,
+            self._auto_off,
+            self._attr_unique_id,
+        )
 
     @property
     def device_info(self):
@@ -91,56 +148,101 @@ class ProvisionMotionBinarySensor(BinarySensorEntity):
         }
 
     async def async_added_to_hass(self) -> None:
+        """Register dispatcher callback on add."""
         @callback
         def _on_motion(channel: str, active: bool):
-            # "unknown" accetta tutti i canali
+            # The "unknown" sensor accepts all channels
             if self._channel != "unknown" and str(channel) != self._channel:
                 return
+            _LOGGER.debug(
+                "[%s][ch=%s] Motion event received: active=%s (raw_channel=%s)",
+                self._entry_id,
+                self._channel,
+                active,
+                channel,
+            )
             self._set_state(bool(active))
 
         self._unsub_motion = async_dispatcher_connect(
             self.hass, f"{SIGNAL_MOTION}_{self._entry_id}", _on_motion
         )
+        _LOGGER.debug(
+            "[%s][ch=%s] Subscribed to motion signal.",
+            self._entry_id,
+            self._channel,
+        )
 
     async def async_will_remove_from_hass(self) -> None:
+        """Clean up callbacks and timers."""
         if self._unsub_motion:
             self._unsub_motion()
             self._unsub_motion = None
+            _LOGGER.debug("[%s][ch=%s] Unsubscribed from motion signal.", self._entry_id, self._channel)
         if self._auto_unsub:
             self._auto_unsub()
             self._auto_unsub = None
+            _LOGGER.debug("[%s][ch=%s] Auto-off timer cancelled on removal.", self._entry_id, self._channel)
 
     # ---------------- AUTO-OFF ----------------
 
     @callback
     def _schedule_auto_off(self) -> None:
-        # cancella eventuale timer precedente
+        """Schedule automatic OFF after the configured delay."""
+        # Cancel any previous timer
         if self._auto_unsub:
             self._auto_unsub()
             self._auto_unsub = None
+
         if not self._attr_is_on or self._auto_off <= 0:
             return
 
         @callback
         def _off(_now) -> None:
+            _LOGGER.info(
+                "[%s][ch=%s] Auto-off elapsed (%.3f s) → turning OFF.",
+                self._entry_id,
+                self._channel,
+                self._auto_off,
+            )
             self._attr_is_on = False
             self._auto_unsub = None
             self.async_write_ha_state()
 
+        _LOGGER.debug(
+            "[%s][ch=%s] Scheduling auto-off in %.3f s.",
+            self._entry_id,
+            self._channel,
+            self._auto_off,
+        )
         self._auto_unsub = async_call_later(self.hass, self._auto_off, _off)
 
     @callback
     def _set_state(self, new_state: bool) -> None:
-        # annulla timer se cambia stato
+        """Set the sensor state and handle auto-off timers."""
+        # Cancel any pending timer when a new state comes in
         if self._auto_unsub:
             self._auto_unsub()
             self._auto_unsub = None
+            _LOGGER.debug("[%s][ch=%s] Previous auto-off timer cancelled.", self._entry_id, self._channel)
 
         if self._attr_is_on == new_state:
-            # comunque ripianifica se resta ON (utile se arrivano ripetuti ON)
+            # Re-schedule auto-off if we remain ON (useful on repeated ON events)
             if new_state and self._auto_off > 0:
+                _LOGGER.debug(
+                    "[%s][ch=%s] State unchanged (ON) → re-scheduling auto-off.",
+                    self._entry_id,
+                    self._channel,
+                )
                 self._schedule_auto_off()
             return
+
+        _LOGGER.info(
+            "[%s][ch=%s] State change: %s → %s",
+            self._entry_id,
+            self._channel,
+            "ON" if self._attr_is_on else "OFF",
+            "ON" if new_state else "OFF",
+        )
 
         self._attr_is_on = new_state
         self.async_write_ha_state()
