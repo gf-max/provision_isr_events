@@ -3,10 +3,10 @@
     "step": {
       "user": {
         "title": "Provision-ISR ONVIF Events",
-        "description": "Inserisci i parametri ONVIF del tuo NVR Provision-ISR.",
+        "description": "Enter ONVIF parameters of your Provision-ISR NVR.",
         "data": {
           "host": "Host/IP",
-          "port": "Porta (default 80)",
+          "port": "Port (default 80)",
           "username": "Username",
           "password": "Password"
         }
@@ -16,11 +16,22 @@
   "options": {
     "step": {
       "basic": {
-        "title": "Opzioni",
+        "title": "Options",
+        "description": "Global settings and channel list.",
         "data": {
-          "auto_off": "Auto OFF (secondi)",
-          "channels": "Canali (es. 1,2,6) — vuoto = unknown"
+          "auto_off": "Auto OFF (seconds)",
+          "channels": "Channels (e.g. 1,2,6) — empty = unknown",
+          "snapshot_on_motion": "Take snapshot on motion (default)",
+          "snapshot_dir": "Snapshot directory (relative to /config, e.g. www/snapshots)",
+          "snapshot_min_interval": "Minimum interval between snapshots (seconds)",
+          "retention_days": "Retention (days)",
+          "retention_max_files": "Maximum files per channel",
+          "keep_latest_only": "Keep only the latest snapshot per channel"
         }
+      },
+      "channels": {
+        "title": "Channels",
+        "description": "Configure per-channel snapshot toggle for: {channels}"
       }
     }
   }

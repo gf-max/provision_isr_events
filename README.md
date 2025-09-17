@@ -22,6 +22,18 @@ This makes it possible to trigger **automations, notifications, or actions** in 
 3. Go to **Settings → Devices & Services → Add Integration** and search for **Provision-ISR Events**.  
 4. Enter your NVR connection details (host, port, username, password).  
 
+## Installation via HACS
+1. Open HACS → Integrations → **Custom repositories**
+2. Add repository URL: `https://github.com/youraccount/provision_isr_events`
+3. Select category: `Integration`
+4. Install and restart Home Assistant
+
+## Configuration
+The component is configured via the Home Assistant UI. Required fields:
+- Host/IP  
+- Port (default: 80)  
+- Username / Password  
+
 ## Options
 - **Auto OFF (seconds):** Default time before a motion sensor resets to OFF.  
 - **Auto OFF Map:** Optional per-channel configuration. Example:  
