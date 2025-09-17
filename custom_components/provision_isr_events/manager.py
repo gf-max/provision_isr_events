@@ -44,7 +44,14 @@ PULL_TIMEOUT_SEC = 10            # PullMessages timeout (PT10S)
 
 
 class ProvisionOnvifEventManager:
-    """Subscribe and poll ONVIF events (PullPoint) in a dedicated thread."""
+    """Subscribe and poll ONVIF events (PullPoint) in a dedicated thread.
+
+    Design notes:
+    - ONVIF/python-onvif uses aiohttp under the hood in recent versions.
+      aiohttp requires an *asyncio running loop* in the current thread.
+    - Python threads do NOT have a loop by default: we must create and set it.
+    - All blocking ONVIF work is executed inside this thread which *owns* its loop.
+    """
 
     def __init__(
         self,
@@ -55,6 +62,7 @@ class ProvisionOnvifEventManager:
         password: str,
         entry_id: str,
     ) -> None:
+        # HA & connection params
         self.hass = hass
         self.host = host
         self.port = port
@@ -62,27 +70,28 @@ class ProvisionOnvifEventManager:
         self.password = password
         self.entry_id = entry_id
 
+        # Discovery state and lifecycle
         self._known_channels: set[str] = set()
         self._stop_ev = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
-        # ONVIF-related objects created/used inside the thread
+        # ONVIF-related objects (created inside the thread after loop is set)
         self._cam = None
         self._events = None
         self._pullpoint = None
 
-        # optional subscription manager/address (for unsubscribe)
+        # Optional unsubscribe plumbing
         self._subscription_mgr = None
         self._subscription_addr = None
 
-        # cache for options and last snapshot timestamps
+        # Options cache and per-channel snapshot throttling
         self._options_cache: dict | None = None
         self._last_snapshot_at: dict[str, float] = {}
 
     # --------------------------- LIFECYCLE ---------------------------
 
     def start(self) -> None:
-        """Start the polling thread."""
+        """Start the polling thread (idempotent)."""
         if self._thread and self._thread.is_alive():
             return
         self._stop_ev.clear()
@@ -95,7 +104,7 @@ class ProvisionOnvifEventManager:
         _LOGGER.info("Event manager started for %s:%s", self.host, self.port)
 
     def stop(self) -> None:
-        """Stop thread and cleanup."""
+        """Signal stop and wait the thread to finish, then cleanup."""
         self._stop_ev.set()
         if self._thread:
             self._thread.join(timeout=10)
@@ -112,42 +121,91 @@ class ProvisionOnvifEventManager:
     # --------------------------- THREAD LOOP ---------------------------
 
     def _runner_thread(self) -> None:
-        """Main loop: connect → subscribe → pull → dispatch, with retry/backoff."""
-        _LOGGER.debug("Run loop entered")
-        while not self._stop_ev.is_set():
-            try:
-                self._create_camera_and_services()
-                self._subscribe_pullpoint()
-                self._poll_loop()
-            except Exception as ex:
-                msg = str(ex) or ""
-                if "Reach the maximum of NotificationProducers" in msg:
-                    wait_s = max(120, int(PULL_TIMEOUT_SEC * 6))
-                    _LOGGER.warning(
-                        "ONVIF subscription limit reached; waiting %ss before retry",
-                        wait_s,
-                    )
-                    self._cleanup_services()
-                    self._stop_ev.wait(wait_s)
-                else:
-                    _LOGGER.warning("ONVIF events loop ended with error: %s", ex, exc_info=True)
-                    self._cleanup_services()
-                    self._stop_ev.wait(RECONNECT_BACKOFF_SEC)
+        """Main loop: create thread-owned asyncio loop → connect → subscribe → pull → dispatch.
 
-        self._cleanup_services()
+        Important:
+        - aiohttp uses asyncio.get_running_loop(); without this, you'll get
+          RuntimeError: no running event loop.
+        - We create a new loop for THIS thread and set it as current.
+        """
+        _LOGGER.debug("Run loop entered")
+
+        # Create and set an asyncio event loop for this thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        try:
+            while not self._stop_ev.is_set():
+                try:
+                    # Initialize ONVIF clients/services (requires a running loop)
+                    self._create_camera_and_services()
+                    # Create PullPoint subscription
+                    self._subscribe_pullpoint()
+                    # Start pulling messages until an error or stop is requested
+                    self._poll_loop()
+                except Exception as ex:
+                    msg = str(ex) or ""
+                    if "Reach the maximum of NotificationProducers" in msg:
+                        # Device has too many concurrent subscriptions; back off longer
+                        wait_s = max(120, int(PULL_TIMEOUT_SEC * 6))
+                        _LOGGER.warning(
+                            "ONVIF subscription limit reached; waiting %ss before retry",
+                            wait_s,
+                        )
+                        self._cleanup_services()
+                        self._stop_ev.wait(wait_s)
+                    else:
+                        _LOGGER.warning("ONVIF events loop ended with error: %s", ex, exc_info=True)
+                        self._cleanup_services()
+                        self._stop_ev.wait(RECONNECT_BACKOFF_SEC)
+
+            # On stop signal, final cleanup
+            self._cleanup_services()
+
+        finally:
+            # Best-effort aiohttp session close (if exposed by the library)
+            try:
+                dev = getattr(self, "_cam", None)
+                sess = getattr(getattr(getattr(dev, "devicemgmt", None), "transport", None), "session", None)
+                if sess and not sess.closed:
+                    loop.run_until_complete(sess.close())
+            except Exception:
+                pass
+
+            # Cancel any pending tasks bound to this loop
+            try:
+                pending = asyncio.all_tasks(loop=loop)
+                for t in pending:
+                    t.cancel()
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            except Exception:
+                pass
+
+            # Detach and close loop
+            asyncio.set_event_loop(None)
+            loop.close()
+            _LOGGER.debug("Thread event loop closed")
 
     def _create_camera_and_services(self) -> None:
-        """Create ONVIFCamera and required services. Runs in the thread."""
+        """Create ONVIFCamera and required services. Runs in the thread after loop is set.
+
+        Note:
+        - Import ONVIFCamera inside the method to avoid import-time side effects
+          (some libs may touch asyncio during import).
+        """
         _LOGGER.debug("Creating ONVIFCamera for %s:%s", self.host, self.port)
         from onvif import ONVIFCamera  # type: ignore
 
         self._cam = ONVIFCamera(self.host, self.port, self.username, self.password)
 
+        # Check device capabilities (Events must be available)
         dev_mgmt = self._cam.create_devicemgmt_service()
         caps = dev_mgmt.GetCapabilities({"Category": "Events"})
         if not getattr(caps, "Events", None):
             raise RuntimeError("Device does not expose ONVIF Events capability")
 
+        # Events service used for CreatePullPointSubscription / PullPoint
         self._events = self._cam.create_events_service()
 
     def _subscribe_pullpoint(self) -> None:
@@ -157,26 +215,31 @@ class ProvisionOnvifEventManager:
             "InitialTerminationTime": "PT300S"  # 5 minutes
         })
 
+        # Try to extract the subscription address (some devices return it, some don't)
         address = None
         try:
             address = getattr(getattr(sub, "SubscriptionReference", None), "Address", None)
-            if hasattr(address, "_value_1"):  # zeep AnyURI
+            if hasattr(address, "_value_1"):  # zeep AnyURI case
                 address = address._value_1
         except Exception:
             address = None
 
         if address:
+            # Use explicit PullPoint address when available
             self._pullpoint = self._cam.create_pullpoint_service(address)
             _LOGGER.debug("PullPoint with address: %s", address)
         else:
+            # Fallback: some devices work without explicit address
             self._pullpoint = self._cam.create_pullpoint_service()
             _LOGGER.debug("PullPoint without address (fallback)")
 
+        # Optional sync point (not all devices support it)
         try:
             self._events.SetSynchronizationPoint()
         except Exception as ex:
             _LOGGER.debug("SetSynchronizationPoint unsupported: %s", ex)
 
+        # Prepare SubscriptionManager for Unsubscribe (best-effort)
         self._subscription_mgr = None
         self._subscription_addr = address
         if address:
@@ -229,12 +292,14 @@ class ProvisionOnvifEventManager:
                         self._schedule_snapshot(ch, active)
 
             except Exception as ex:
+                # Break and let outer loop handle reconnect/backoff
                 _LOGGER.debug("Error during PullMessages: %s", ex, exc_info=True)
                 break
 
         _LOGGER.info("Exiting events polling loop")
 
     def _cleanup_services(self) -> None:
+        """Best-effort unsubscribe and drop references to ONVIF services."""
         try:
             if self._subscription_mgr is not None:
                 self._subscription_mgr.Unsubscribe()
@@ -251,7 +316,13 @@ class ProvisionOnvifEventManager:
     # --------------------------- PARSING & DISPATCH ---------------------------
 
     def _parse_motion_from_notification(self, note: object) -> Tuple[Optional[str], Optional[bool]]:
-        """Return (channel, active) from ONVIF SimpleItem with multiple variants and fallbacks."""
+        """Return (channel, active) from ONVIF SimpleItem with multiple variants and fallbacks.
+
+        Strategy:
+        - Collect tt:SimpleItem Name/Value pairs and look for common keys.
+        - Try to extract channel/token from several fields.
+        - Fallback: parse channel from Topic string.
+        """
         try:
             message = getattr(note, "Message", None)
             elem = getattr(message, "_value_1", None)  # lxml.etree._Element
@@ -329,7 +400,7 @@ class ProvisionOnvifEventManager:
         return None
 
     def _dispatch_motion(self, channel: str, active: bool) -> None:
-        """Send dispatcher signal to binary_sensors (thread → main loop)."""
+        """Send dispatcher signal to binary_sensors (thread → HA main loop)."""
         @callback
         def _fire() -> None:
             async_dispatcher_send(
@@ -338,10 +409,11 @@ class ProvisionOnvifEventManager:
                 channel,
                 active,
             )
+        # Schedule on HA loop (thread-safe)
         self.hass.loop.call_soon_threadsafe(_fire)
 
     def _send_discovery(self, channel: str) -> None:
-        """Send discovery signal (thread → main loop)."""
+        """Send discovery signal (thread → HA main loop)."""
         @callback
         def _fire() -> None:
             async_dispatcher_send(self.hass, f"{SIGNAL_DISCOVERY}_{self.entry_id}", channel)
@@ -380,6 +452,7 @@ class ProvisionOnvifEventManager:
         """Thread-safe schedule of the async snapshot routine on HA loop."""
         coro = self._async_snapshot_if_enabled(channel, active)
         try:
+            # Use run_coroutine_threadsafe to schedule from a non-HA thread
             asyncio.run_coroutine_threadsafe(coro, self.hass.loop)
         except Exception as ex:
             _LOGGER.error("Thread-safe schedule failed (ch %s): %s", channel, ex)
@@ -434,6 +507,7 @@ class ProvisionOnvifEventManager:
         fullpath = os.path.join(base_dir, filename)
 
         try:
+            # Call HA camera.snapshot service (blocking=True to ensure file is written)
             await self.hass.services.async_call(
                 "camera",
                 "snapshot",
