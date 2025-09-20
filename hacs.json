@@ -2,5 +2,6 @@
   "name": "Provision-ISR ONVIF Events",
   "content_in_root": false,
   "render_readme": true,
-  "domains": ["provision_isr_events"]
+  "domains": ["provision_isr_events"],
+  "version": "1.1.0"
 }
