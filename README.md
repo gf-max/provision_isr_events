@@ -96,7 +96,11 @@ logger:
   logs:
     custom_components.provision_isr_events: debug
 ```
-
+## Tested hardware & firmware
+- **Model:** Provision-ISR **NVR5-8200PX+(MM)**
+- **Firmware:** `1.4.12.80169B250724.N0M.U2(8A118)` (launch date `2025-07-24`)
+- **ONVIF:** Client `23.12`, Device `23.12`
+  
 ## Disclaimer
 This is a **community-made integration**.  
 - It is **not affiliated with, authorized, or endorsed by Provision-ISR**.  
