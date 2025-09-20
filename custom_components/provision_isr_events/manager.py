@@ -21,26 +21,39 @@ from .const import (
     SIGNAL_DISCOVERY,
     TT_NS,
     CONF_CHANNEL_FLAGS,
+    # snapshot options
     CONF_SNAPSHOT_ON_MOTION,
     CONF_SNAPSHOT_DIR,
     CONF_SNAPSHOT_MIN_INTERVAL,
+    CONF_SNAPSHOT_DELAY_MS,               # NEW
+    CONF_SNAPSHOT_BURST,                  # NEW
+    CONF_SNAPSHOT_BURST_INTERVAL_MS,      # NEW
+    # retention options
     CONF_RETENTION_DAYS,
     CONF_RETENTION_MAX_FILES,
     CONF_KEEP_LATEST_ONLY,
+    # defaults
     DEFAULT_SNAPSHOT_ON_MOTION,
     DEFAULT_SNAPSHOT_DIR,
     DEFAULT_SNAPSHOT_MIN_INTERVAL,
+    DEFAULT_SNAPSHOT_DELAY_MS,            # NEW
+    DEFAULT_SNAPSHOT_BURST,               # NEW
+    DEFAULT_SNAPSHOT_BURST_INTERVAL_MS,   # NEW
     DEFAULT_RETENTION_DAYS,
     DEFAULT_RETENTION_MAX_FILES,
     DEFAULT_KEEP_LATEST_ONLY,
+    PULL_INTERVAL_SEC,
+    RECONNECT_BACKOFF_SEC,
+    PULL_TIMEOUT_SEC,
+    PULL_MESSAGE_LIMIT,
+    IDLE_SLEEP_MIN_SEC,
+    IDLE_SLEEP_MAX_SEC,
+
 )
 
 _LOGGER = logging.getLogger(__name__)
 
-# Timings
-PULL_INTERVAL_SEC = 1.0          # sleep between pulls when there are no events
-RECONNECT_BACKOFF_SEC = 5.0      # wait before a standard reconnect attempt
-PULL_TIMEOUT_SEC = 10            # PullMessages timeout (PT10S)
+
 
 
 class ProvisionOnvifEventManager:
@@ -121,13 +134,7 @@ class ProvisionOnvifEventManager:
     # --------------------------- THREAD LOOP ---------------------------
 
     def _runner_thread(self) -> None:
-        """Main loop: create thread-owned asyncio loop → connect → subscribe → pull → dispatch.
-
-        Important:
-        - aiohttp uses asyncio.get_running_loop(); without this, you'll get
-          RuntimeError: no running event loop.
-        - We create a new loop for THIS thread and set it as current.
-        """
+        """Main loop: create thread-owned asyncio loop → connect → subscribe → pull → dispatch."""
         _LOGGER.debug("Run loop entered")
 
         # Create and set an asyncio event loop for this thread
@@ -250,23 +257,43 @@ class ProvisionOnvifEventManager:
                 _LOGGER.debug("SubscriptionManager unavailable: %s", ex)
 
     def _poll_loop(self) -> None:
-        """Continuous cycle: PullMessages → parse → dispatch (pairing Source→State)."""
+        """Continuous cycle: PullMessages → parse → dispatch with adaptive idle sleep.
+
+        Strategy:
+        - Keep a short idle sleep while events are flowing ("hot" state).
+        - When no events are returned, gradually increase the idle sleep up to a cap.
+        - Preserve fractional PullMessages timeout if provided (e.g. 1.2 → "PT1.2S").
+        """
         _LOGGER.info("Starting ONVIF events polling (PullPoint)")
+
+        # Start in "hot" mode for low latency
+        idle_sleep = IDLE_SLEEP_MIN_SEC
+
+        # Format ONVIF duration string keeping fractional seconds if configured
+        timeout_str = f"PT{PULL_TIMEOUT_SEC}S"
+
         while not self._stop_ev.is_set():
             try:
                 msgs = self._pullpoint.PullMessages(
-                    {"Timeout": f"PT{PULL_TIMEOUT_SEC}S", "MessageLimit": 10}
+                    {"Timeout": timeout_str, "MessageLimit": PULL_MESSAGE_LIMIT}
                 )
                 notifications = getattr(msgs, "NotificationMessage", None)
+
                 if not notifications:
-                    self._stop_ev.wait(PULL_INTERVAL_SEC)
+                    # No events → back off a bit (bounded exponential-ish)
+                    idle_sleep = min(IDLE_SLEEP_MAX_SEC, idle_sleep * 1.5 + 0.01)
+                    self._stop_ev.wait(idle_sleep)
                     continue
+
+                # Got events → go hot immediately
+                idle_sleep = IDLE_SLEEP_MIN_SEC
+
                 if not isinstance(notifications, list):
                     notifications = [notifications]
 
                 _LOGGER.debug("Pull returned %d notifications", len(notifications))
 
-                # Pairing: if a batch contains a State without Source, use the last channel in the batch
+                # If a batch contains a State without Source, reuse the last seen channel
                 last_channel: Optional[str] = None
 
                 for idx, note in enumerate(notifications):
@@ -276,27 +303,28 @@ class ProvisionOnvifEventManager:
                     if ch is not None:
                         last_channel = ch
                     elif ch is None and active is not None and last_channel is not None:
-                        ch = last_channel  # associate to last-known channel in the batch
+                        ch = last_channel  # pair State with the last Source
 
                     _LOGGER.debug("parsed[%d]: channel=%s active=%s", idx, ch, active)
                     if ch is None or active is None:
                         continue
 
-                    # discovery + dispatch
+                    # Discovery + dispatch
                     self._maybe_discover(ch)
                     _LOGGER.debug("dispatch: entry=%s channel=%s active=%s", self.entry_id, ch, active)
                     self._dispatch_motion(ch, active)
 
-                    # snapshot scheduling when motion is ON
+                    # Schedule snapshot on rising edge
                     if active:
                         self._schedule_snapshot(ch, active)
 
             except Exception as ex:
-                # Break and let outer loop handle reconnect/backoff
+                # Break and let the outer loop handle reconnect/backoff
                 _LOGGER.debug("Error during PullMessages: %s", ex, exc_info=True)
                 break
 
         _LOGGER.info("Exiting events polling loop")
+
 
     def _cleanup_services(self) -> None:
         """Best-effort unsubscribe and drop references to ONVIF services."""
@@ -343,7 +371,7 @@ class ProvisionOnvifEventManager:
                 v = val.strip()
 
                 # Common variants for motion state
-                if lname in {"state", "ismotion", "ismotiondetected", "motion", "isactive", "detected"}:
+                if lname in {"state", "ismotion", "ismotiondetected", "motion", "isactive", "detected", "logicalstate"}:
                     lv = v.lower()
                     if lv in {"true", "1", "on", "active", "yes"}:
                         active = True
@@ -473,7 +501,7 @@ class ProvisionOnvifEventManager:
             _LOGGER.debug("Snapshot skipped (channel %s disabled)", channel)
             return
 
-        # Cooldown
+        # Per-channel cooldown
         min_interval = int(opts.get(CONF_SNAPSHOT_MIN_INTERVAL, DEFAULT_SNAPSHOT_MIN_INTERVAL) or 0)
         now = time.time()
         last = self._last_snapshot_at.get(channel, 0.0)
@@ -496,7 +524,9 @@ class ProvisionOnvifEventManager:
             _LOGGER.error("Snapshot: unable to create dir %s: %s", base_dir, ex)
             return
 
-        # Filename: latest or timestamped
+        # Compute filename once per event:
+        # - if keep_latest: always write "..._latest.jpg"
+        # - else: write one timestamped file per event (even with burst we overwrite it)
         keep_latest = bool(opts.get(CONF_KEEP_LATEST_ONLY, DEFAULT_KEEP_LATEST_ONLY))
         ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = (
@@ -506,14 +536,26 @@ class ProvisionOnvifEventManager:
         )
         fullpath = os.path.join(base_dir, filename)
 
+        # Configurable delay before the first shot (to capture a more meaningful frame)
+        delay_ms = int(opts.get(CONF_SNAPSHOT_DELAY_MS, DEFAULT_SNAPSHOT_DELAY_MS))
+        if delay_ms > 0:
+            await asyncio.sleep(delay_ms / 1000.0)
+
+        # Optional burst: take N frames separated by a short interval, overwriting the same file.
+        burst = max(1, int(opts.get(CONF_SNAPSHOT_BURST, DEFAULT_SNAPSHOT_BURST)))
+        burst_iv_ms = int(opts.get(CONF_SNAPSHOT_BURST_INTERVAL_MS, DEFAULT_SNAPSHOT_BURST_INTERVAL_MS))
+
         try:
-            # Call HA camera.snapshot service (blocking=True to ensure file is written)
-            await self.hass.services.async_call(
-                "camera",
-                "snapshot",
-                {"entity_id": camera_entity, "filename": fullpath},
-                blocking=True,
-            )
+            for i in range(burst):
+                await self.hass.services.async_call(
+                    "camera",
+                    "snapshot",
+                    {"entity_id": camera_entity, "filename": fullpath},
+                    blocking=True,
+                )
+                if i < burst - 1 and burst_iv_ms > 0:
+                    await asyncio.sleep(burst_iv_ms / 1000.0)
+
             self._last_snapshot_at[channel] = now
 
             # Build /local URL if under www
@@ -602,22 +644,49 @@ class ProvisionOnvifEventManager:
 
         _LOGGER.debug("Resolver: no reliable camera for channel %s. Top=%s (score=%d)", ch, best_eid, best_score)
         return None
-
     async def _async_prune_snapshots(self, base_dir: str, channel: str, opts: dict) -> None:
-        """Delete old files based on retention_days and cap max files per channel."""
+        """Schedule snapshot pruning on the executor to avoid blocking the event loop."""
         try:
+            await self.hass.async_add_executor_job(self._prune_snapshots_blocking, base_dir, channel, opts)
+        except Exception as ex:
+            _LOGGER.debug("Prune (async) error (ch %s): %s", channel, ex)
+
+
+    def _prune_snapshots_blocking(self, base_dir: str, channel: str, opts: dict) -> None:
+        """Blocking filesystem pruning (runs in executor)."""
+        try:
+            import os
+            import time
+            from pathlib import Path
+
             retention_days = int(opts.get(CONF_RETENTION_DAYS, DEFAULT_RETENTION_DAYS) or 0)
             max_files = int(opts.get(CONF_RETENTION_MAX_FILES, DEFAULT_RETENTION_MAX_FILES) or 0)
             keep_latest = bool(opts.get(CONF_KEEP_LATEST_ONLY, DEFAULT_KEEP_LATEST_ONLY))
 
-            # pattern: all files for this entry+channel
-            pattern = os.path.join(base_dir, f"nvr_{self.entry_id}_ch{channel}_*.jpg")
-            files = [Path(p) for p in glob.glob(pattern)]
+            # File name patterns
+            prefix = f"nvr_{self.entry_id}_ch{channel}_"
+            latest_name = f"{prefix}latest.jpg"
+            latest_path = Path(os.path.join(base_dir, latest_name)) if keep_latest else None
+
+            # Fast scan with scandir (faster than glob and we are already in executor)
+            def _list_snapshots() -> list[Path]:
+                res: list[Path] = []
+                try:
+                    with os.scandir(base_dir) as it:
+                        for de in it:
+                            if not de.is_file():
+                                continue
+                            name = de.name
+                            if not (name.startswith(prefix) and name.endswith(".jpg")):
+                                continue
+                            res.append(Path(de.path))
+                except FileNotFoundError:
+                    return []
+                return res
+
+            files = _list_snapshots()
             if not files:
                 return
-
-            latest_name = f"nvr_{self.entry_id}_ch{channel}_latest.jpg"
-            latest_path = Path(os.path.join(base_dir, latest_name)) if keep_latest else None
 
             # 1) Age-based retention
             if retention_days and retention_days > 0:
@@ -637,14 +706,21 @@ class ProvisionOnvifEventManager:
 
             # 2) Cap maximum number of files per channel
             if max_files and max_files > 0:
-                files = [Path(p) for p in glob.glob(pattern)]
+                files = _list_snapshots()  # refresh
                 if keep_latest and latest_path and latest_path.exists():
                     try:
                         files = [f for f in files if not f.samefile(latest_path)]
                     except Exception:
-                        # If samefile fails for any reason, keep all and rely on sort below
+                        # Fallback: keep all, rely on sort below
                         pass
-                files.sort(key=lambda p: p.stat().st_mtime)
+
+                try:
+                    files.sort(key=lambda p: p.stat().st_mtime)
+                except Exception:
+                    # If a file disappears between scan/stat, ignore
+                    files = [f for f in files if f.exists()]
+                    files.sort(key=lambda p: p.stat().st_mtime)
+
                 excess = max(0, len(files) - max_files)
                 for fp in files[:excess]:
                     try:
@@ -653,7 +729,7 @@ class ProvisionOnvifEventManager:
                         _LOGGER.debug("Prune (count): skip %s (%s)", fp.name, ex)
 
         except Exception as ex:
-            _LOGGER.debug("Prune error (ch %s): %s", channel, ex)
+            _LOGGER.debug("Prune (blocking) error (ch %s): %s", channel, ex)
 
 
 __all__ = ["ProvisionOnvifEventManager"]
